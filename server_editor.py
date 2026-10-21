@@ -19,6 +19,7 @@ from pathlib import Path
 from typing import Optional
 
 import numpy as np
+import onnxruntime
 import requests
 import torch
 import uvicorn
@@ -184,8 +185,15 @@ parser.add_argument("--preload_onnx_bert", action="store_true")
 parser.add_argument("--onnx", action="store_true")
 args = parser.parse_args()
 device = args.device
-if device == "cuda" and not torch.cuda.is_available():
-    device = "cpu"
+if device == "cuda":
+    # ONNX モデルは onnxruntime だけで推論するため、PyTorch が CUDA 非対応でも
+    # (例: JetPack 5 上の Python 3.10) onnxruntime が CUDA を使えれば GPU で動かす
+    if args.onnx:
+        if "CUDAExecutionProvider" not in onnxruntime.get_available_providers():
+            device = "cpu"
+    elif not torch.cuda.is_available():
+        device = "cpu"
+logger.info(f"Device: {device} (onnx={args.onnx})")
 model_dir = Path(args.model_dir)
 port = int(args.port)
 # if not args.skip_default_models:
