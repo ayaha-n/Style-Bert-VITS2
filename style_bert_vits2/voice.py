@@ -34,8 +34,10 @@ def adjust_voice(
 
     wave = wave.astype(np.double)
 
-    # 質が高そうだしとりあえずharvestにしておく
-    f0, t = pyworld.harvest(wave, fs)
+    # harvest は遅く、Jetson では合成本体 (GPU) より時間がかかるので、
+    # dio で f0 を求めて stonemask で補正する
+    f0, t = pyworld.dio(wave, fs)
+    f0 = pyworld.stonemask(wave, f0, t, fs)
 
     sp = pyworld.cheaptrick(wave, f0, t, fs)
     ap = pyworld.d4c(wave, f0, t, fs)
