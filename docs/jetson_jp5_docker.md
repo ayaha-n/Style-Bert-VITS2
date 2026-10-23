@@ -2,7 +2,17 @@
 
 reComputer Mini J4012 (Jetson Orin NX 16GB) など、JetPack 5 (L4T r35, Ubuntu 20.04) の
 Jetson で `server_editor.py --onnx` を GPU で動かすための手順です。
-**まだ実機では試していません。** 試して分かったことはこのファイルに書き足してください。
+reComputer Mini J4012 (L4T r35.5.0, JetPack 5.1.3) で動作を確認しました。
+
+使うファイルは [`docs/jetson_jp5/`](jetson_jp5/) にあります。
+
+| ファイル | 役割 |
+|---|---|
+| `install_py310.sh` | Python 3.10 をソースからビルドする (コンテナ内で使う) |
+| `build_ort.sh` | onnxruntime-gpu 1.18.1 (Python 3.10, CUDA) の wheel をビルドする (コンテナ内で使う) |
+| `patch_antialias.py` | onnxruntime を CUDA 11.4 でビルドするためのソースの修正 (`build_ort.sh` が使う) |
+| `Dockerfile` | サーバー用のイメージ `sbv2-jp5` |
+| `run_server.sh` | サーバーを起動する (ホストで使う) |
 
 ## なぜ Docker か
 
@@ -10,9 +20,12 @@ Jetson で `server_editor.py --onnx` を GPU で動かすための手順です�
   NVIDIA が配布する Jetson 用の PyTorch や onnxruntime-gpu も JetPack 5 向けは Python 3.8 用が中心です。
 - JetPack 6 に上げれば Python 3.10 になりますが、ROS noetic などホスト側の環境を変えたくないので、
   サーバーだけを r35 系のコンテナに入れ、その中で Python 3.10 を使います。
+  ホストに入れるものはなく、作られるのは Docker イメージと作業ディレクトリ (`~/ort-build`) だけです。
 - r36 系 (JetPack 6) のイメージは JetPack 5 のホストでは動きません。r35 系を使います。
 
-## このフォークでの変更: `--onnx` では PyTorch の CUDA を見ない
+## このフォークでの変更
+
+### `--onnx` では PyTorch の CUDA を見ない
 
 ONNX モデルの推論 (`style_bert_vits2/models/infer_onnx.py` と ONNX 版 BERT) は onnxruntime だけで行い、
 PyTorch は使いません。ところが `server_editor.py` は `--device cuda` のとき
@@ -24,131 +37,129 @@ Python 3.10 で使える CUDA 対応の PyTorch は JetPack 5 では手に入り
 これにより、コンテナには **CPU 版の PyTorch と、CUDA 対応の onnxruntime-gpu** があれば足ります。
 GPU が必要なのは onnxruntime-gpu だけです。
 
+### ピッチと抑揚の調整を速くする
+
+`pitchScale` か `intonationScale` が 1.0 でないとき、合成した音声を pyworld で作り直します
+(`style_bert_vits2/voice.py`)。この処理は CPU で動き、f0 の推定に使っていた `harvest` が遅く、
+Jetson では GPU での合成本体より時間がかかっていました。`dio` + `stonemask` に変えました。
+聞き比べて違いは分かりませんでした。
+
 ## 0. ホストの確認
 
 ```bash
-cat /etc/nv_tegra_release        # 例: R35 (release), REVISION: 4.1 → L4T r35.4.1
-docker info | grep -i runtime    # nvidia ランタイムがあること
+cat /etc/nv_tegra_release        # 例: R35 (release), REVISION: 5.0 → L4T r35.5.0
+sudo docker info | grep -i runtime    # nvidia ランタイムがあること
 ```
 
 JetPack を SDK Manager などで入れていれば `nvidia-container-runtime` も入っています。
-以下の `r35.4.1` は、ホストの L4T に合わせて読み替えてください
-(r35.x のコンテナは r35.x の別リビジョンのホストでもおおむね動きます)。
+コンテナのイメージは `nvcr.io/nvidia/l4t-jetpack:r35.4.1` を使います
+(r35.5.0 のホストで動きました。r35.x のコンテナは r35.x の別リビジョンのホストでもおおむね動きます)。
 
-onnxruntime のビルドはメモリを多く使うので、スワップを足しておくと安全です。
+モデル (pooh_body の `new_model2`) は Git LFS で管理されています。中身が 134 バイトの
+ポインタのままなら、LFS をそのリポジトリだけで有効にして取得します
+(`--local` を付けないと `~/.gitconfig` が変わり、LFS を使うほかのリポジトリにも効きます)。
 
 ```bash
-sudo fallocate -l 16G /swapfile && sudo chmod 600 /swapfile
-sudo mkswap /swapfile && sudo swapon /swapfile
+sudo apt install git-lfs
+cd ~/catkin_ws/src/modular_robot_model_zoo
+git lfs install --local
+git lfs pull --include "pooh_body/resources/Style-Bert-VITS2/**"
 ```
 
 ## 1. onnxruntime-gpu (Python 3.10) の wheel を作る
 
 [Jetson Zoo](https://elinux.org/Jetson_Zoo#ONNX_Runtime) の JetPack 5 向け wheel は Python 3.8 用なので、
-Python 3.10 用を自分でビルドします。Jetson Zoo に JetPack 5 向けの 1.18 系があるので、
-CUDA 11.4 / cuDNN 8.6 でビルドできる見込みの v1.18.1 を使います。
-Orin の GPU アーキテクチャは `87` です。
-
-ビルド用のコンテナに入ります (`l4t-jetpack` は CUDA、cuDNN、TensorRT の開発用ファイルを含みます)。
+Python 3.10 用を自分でビルドします。
 
 ```bash
 mkdir -p ~/ort-build
-docker run -it --rm --runtime nvidia -v ~/ort-build:/out nvcr.io/nvidia/l4t-jetpack:r35.4.1 bash
+cp -a ~/Style-Bert-VITS2/docs/jetson_jp5/. ~/ort-build/
+sudo docker run -it --rm --runtime nvidia -v ~/ort-build:/out -e DEBIAN_FRONTEND=noninteractive \
+  nvcr.io/nvidia/l4t-jetpack:r35.4.1 /out/build_ort.sh $(id -u) $(id -g)
+ls ~/ort-build/onnxruntime_gpu-*.whl
 ```
 
-コンテナの中で:
-
-```bash
-apt-get update && apt-get install -y software-properties-common git build-essential
-add-apt-repository -y ppa:deadsnakes/ppa && apt-get update
-apt-get install -y python3.10 python3.10-dev python3.10-venv
-python3.10 -m ensurepip --upgrade
-python3.10 -m pip install -U pip "cmake<4" "numpy<2" packaging wheel setuptools
-
-git clone --recursive --branch v1.18.1 https://github.com/microsoft/onnxruntime /src/onnxruntime
-cd /src/onnxruntime
-# build.sh は python3 (3.8) を使うので、build.py を python3.10 で直接呼ぶ
-python3.10 tools/ci_build/build.py --build_dir build/Linux \
-  --config Release --update --build --parallel 4 --build_wheel \
-  --use_cuda --cuda_home /usr/local/cuda --cudnn_home /usr/lib/aarch64-linux-gnu \
-  --skip_tests --allow_running_as_root \
-  --cmake_extra_defines CMAKE_CUDA_ARCHITECTURES=87 onnxruntime_BUILD_UNIT_TESTS=OFF
-cp build/Linux/Release/dist/onnxruntime_gpu-*.whl /out/
-```
-
-数時間かかります。`--parallel` を増やすと速くなりますが、メモリ不足で落ちやすくなります。
+- `--parallel 2` で数時間かかります。Orin NX 16GB (CPU 4 コアで動作) では、スワップを足さずにメモリは足りました。
+  途中で切れないように byobu や tmux の中で実行します。
+- ログは `~/ort-build/build.log` に残ります。
+- ソースは `~/ort-build/src` に置くので、途中で止まっても同じコマンドで続きからビルドできます。
+- 終わったら、`~/ort-build` の中身の所有者はホストのユーザーに戻ります。
 
 ## 2. サーバー用のイメージを作る
 
-`~/ort-build/` に、次の `Dockerfile` と、1 で作った wheel を置きます。
-
-```dockerfile
-FROM nvcr.io/nvidia/l4t-jetpack:r35.4.1
-
-RUN apt-get update && apt-get install -y software-properties-common build-essential cmake git \
- && add-apt-repository -y ppa:deadsnakes/ppa && apt-get update \
- && apt-get install -y python3.10 python3.10-dev python3.10-venv \
- && rm -rf /var/lib/apt/lists/*
-RUN python3.10 -m venv /venv
-ENV PATH=/venv/bin:$PATH
-RUN pip install -U pip wheel
-
-# PyTorch は CPU 版 (PyPI の aarch64 wheel) で足りる。GPU は onnxruntime-gpu だけが使う
-COPY requirements-infer.txt /tmp/
-RUN grep -v '^onnxruntime' /tmp/requirements-infer.txt > /tmp/req.txt \
- && pip install -r /tmp/req.txt
-COPY onnxruntime_gpu-*.whl /tmp/
-RUN pip install /tmp/onnxruntime_gpu-*.whl
-```
-
 ```bash
 cp ~/Style-Bert-VITS2/requirements-infer.txt ~/ort-build/
-cd ~/ort-build && docker build -t sbv2-jp5 .
+cd ~/ort-build && sudo docker build -t sbv2-jp5 .
+sudo docker run --rm --runtime nvidia sbv2-jp5 \
+  python -c "import onnxruntime as o; print(o.__version__, o.get_available_providers())"
+# 1.18.1 ['CUDAExecutionProvider', 'CPUExecutionProvider'] と出ること
 ```
 
 `requirements-infer.txt` から onnxruntime を外しているのは、PyPI の `onnxruntime` が入ると
 自前の `onnxruntime-gpu` と衝突するためです。
-`pyopenjtalk-dict` などは aarch64 の wheel がなくソースからビルドされることがあります
-(そのために `build-essential` と `cmake` を入れています)。
 
-## 3. 起動する
+## 3. BERT とモデルを置く
 
-リポジトリ (モデル、BERT、ユーザー辞書を含む) はイメージに入れず、マウントします。
-`model_assets/new_model2` は pooh_body のリソースへのシンボリックリンクなので、
-リンク先も同じパスでマウントします。
+`--onnx` のサーバーが使う BERT は、日本語の ONNX 版 `model_fp16.onnx` だけです。
+`initialize.py --only_infer` はほかの言語や PyTorch 版も取って数 GB になるので、これだけを取得します
+(取得済みの PC から scp で持ってきてもかまいません)。
 
 ```bash
-docker run --rm --runtime nvidia --network host \
-  -v $HOME/Style-Bert-VITS2:$HOME/Style-Bert-VITS2 \
-  -v $HOME/catkin_ws/src/modular_robot_model_zoo:$HOME/catkin_ws/src/modular_robot_model_zoo \
-  -w $HOME/Style-Bert-VITS2 sbv2-jp5 \
-  python server_editor.py --device cuda --onnx --port 8000 --skip_static_files
+cd ~/Style-Bert-VITS2
+sudo docker run --rm --user $(id -u):$(id -g) -e HOME=/tmp -v $PWD:$PWD -w $PWD sbv2-jp5 \
+  python -c "from huggingface_hub import hf_hub_download; hf_hub_download('tsukumijima/deberta-v2-large-japanese-char-wwm-onnx', 'model_fp16.onnx', local_dir='bert/deberta-v2-large-japanese-char-wwm-onnx')"
+ln -s ~/catkin_ws/src/modular_robot_model_zoo/pooh_body/resources/Style-Bert-VITS2/model_assets/new_model2 model_assets/
 ```
 
-BERT の ONNX モデルがまだなければ、先に同じコンテナで
-`python initialize.py --only_infer` を実行して取得します。
+## 4. 起動する
+
+```bash
+~/Style-Bert-VITS2/docs/jetson_jp5/run_server.sh cuda 8000
+```
+
+起動ログに `Device: cuda (onnx=True)` と `Uvicorn running on http://0.0.0.0:8000` が出れば動いています。
+最初の合成のあと `Model loaded successfully from ... to CUDAExecutionProvider` と出れば、GPU で合成しています。
+
 TTS ノード (`pooh_body/scripts/style_bert_vits2_tts.py`) 側は変更不要です。
 別のホストで動かす場合は `_server_url` で指定します。
 
-## 4. GPU で動いているか確かめる
+## 速さ
 
-```bash
-docker run --rm --runtime nvidia sbv2-jp5 \
-  python -c "import onnxruntime as o; print(o.get_available_providers())"
-# CUDAExecutionProvider が含まれていること
-```
+TTS ノードの既定値 (`speed` 0.7、`pitchScale` 0.8、`intonationScale` 1.2) で、
+音声 6〜8 秒の文を合成した時間です。
 
-- サーバーの起動ログに `Device: cuda (onnx=True)` と出ること。
-- 最初の合成のあと、`Model loaded successfully from ... to CUDAExecutionProvider` と出ること
-  (`CPUExecutionProvider` なら GPU は使われていません)。
-- 速さは、同じ文を CPU 版 (`--device cpu`) と GPU 版で合成し、音声の長さに対する合成時間で比べます。
-  CPU ではほぼ音声と同じ長さかかっていました。
+| 環境 | 合成時間 / 音声の長さ |
+|---|---|
+| ThinkPad の CPU | 約 1.0 |
+| Jetson のコンテナの CPU (`run_server.sh cpu`) | 約 3.3 |
+| Jetson の GPU (`harvest`) | 約 1.0 |
+| Jetson の GPU (`dio`、現在) | 約 0.6 |
+| Jetson の GPU (`pitchScale`、`intonationScale` とも 1.0) | 約 0.2 |
 
-## うまくいかないとき
+GPU での合成本体は 1〜1.5 秒で、残りはピッチと抑揚の調整 (CPU) の時間です。
+ピッチと抑揚を 1.0 にしても同じ声になるモデル (調整済みの音声で学習し直すなど) にすれば、
+さらに速くなります。
 
-- onnxruntime のビルドが CUDA 11.4 で通らない場合は、少し古い版 (v1.17.x、v1.16.x) を試します。
-- ONNX モデルが新しい opset を要求して読み込めない場合は、onnxruntime の版を上げるか、
-  モデルを低い opset で変換し直します。
-- それでも難しければ、GPU 付きの x86 の VM (Azure の NC 系など) でサーバーを動かし、
-  TTS ノードの `_server_url` をそちらに向けます。x86 なら PyPI の `onnxruntime-gpu` と CUDA 版 PyTorch が
-  そのまま使えます。ネットワークの往復の分だけ遅れが増える点に注意します。
+## うまくいかなかったこと
+
+`build_ort.sh` などで対処済みです。onnxruntime の版を変えるときの参考に残します。
+
+| 症状 | 原因 | 対処 |
+|---|---|---|
+| `Unable to locate package python3.10-dev` | deadsnakes PPA が focal 向けの配布をやめた | `install_py310.sh` でソースからビルド |
+| eigen の `does not match expected value` | GitLab がアーカイブを作り直してハッシュが変わった (中身は同じコミット) | `cmake/deps.txt` のハッシュを `32b145f5…` に変更 |
+| `pytorch_clog` などの `does not match expected value` | ダウンロードの一時的な失敗 | `--update` を 3 回まで繰り返す |
+| `detected dubious ownership in repository` | `/out` がホストのユーザーの所有で、コンテナの git は root | コンテナ内の git だけで `safe.directory` を設定 |
+| `The compiler doesn't support BFLOAT16!!!` | onnxruntime 1.18 は aarch64 で bf16 対応のコンパイラが必要。gcc 9 は非対応 | gcc-10 を使う (`CC`、`CXX`、`CUDAHOSTCXX`) |
+| `'CUDA_R_8F_E4M3' was not declared` | FP8 型は CUDA 11.8 以上 | `--disable_types float8` |
+| `missing return statement at end of non-void function` (`_IsInf`) | CUDA 11.4 の nvcc が `if constexpr` で誤った警告を出し、それがエラー扱いになる | `--compile_no_warning_as_error` |
+| `Call parameter type does not match function signature!` (`resize_antialias_impl.cu`) | CUDA 11.4 の nvcc が `std::tuple` を値渡しするカーネルで内部エラーになる (gcc の版によらない) | `patch_antialias.py` で `cuda::std::tuple` に置き換え |
+| サーバー起動時に `接続が閉じられました` (`update_dict`) | pyopenjtalk が初回に辞書をパッケージのディレクトリに入れようとするが、root 以外では書けない | イメージを作るときに辞書を入れる (`Dockerfile`) |
+| `NvRmMemInitNvmap failed with Permission denied`、`CUDA failure 801` で CPU に切り替わる | Jetson の GPU のデバイスは video グループでないと開けない | `--group-add video` |
+| `Directory 'static' does not exist` | `--skip_static_files` でも `static/` を読み込む | `static/` を作る (`run_server.sh`) |
+
+次のメッセージは出ますが、動作に影響はありません。
+
+- `pthread_setaffinity_np failed ... mask: {5, }`: 電源モードで CPU が 4 コアしか動いていないため。
+- `[transformers] Disabling PyTorch because PyTorch >= 2.6 is required`: `--onnx` では PyTorch を使わない。
+- `Specified provider 'DmlExecutionProvider' is not in available provider names`: Windows 用。
