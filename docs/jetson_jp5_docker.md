@@ -120,8 +120,18 @@ ln -s ~/catkin_ws/src/modular_robot_model_zoo/pooh_body/resources/Style-Bert-VIT
 起動ログに `Device: cuda (onnx=True)` と `Uvicorn running on http://0.0.0.0:8000` が出れば動いています。
 最初の合成のあと `Model loaded successfully from ... to CUDAExecutionProvider` と出れば、GPU で合成しています。
 
-TTS ノード (`pooh_body/scripts/style_bert_vits2_tts.py`) 側は変更不要です。
-別のホストで動かす場合は `_server_url` で指定します。
+ロボットで常に使うときは `--daemon` を付けます。コンテナ `sbv2-server` としてバックグラウンドで起動し、
+以後はホストの起動時に Docker が自動で起動します (sudo が要るのは最初の 1 回だけ)。
+
+```bash
+~/Style-Bert-VITS2/docs/jetson_jp5/run_server.sh --daemon cuda 8000
+sudo docker logs -f sbv2-server     # ログ
+sudo docker rm -f sbv2-server       # 止めて自動起動もやめる
+```
+
+`pooh_bringup.launch` はサーバーを起動せず、TTS ノード (`pooh_body/scripts/style_bert_vits2_tts.py`) だけを起動します。
+TTS ノードはそのまま `localhost:8000` のこのサーバーを使います。
+別のホストのサーバーを使う場合は TTS ノードの `_server_url` で指定します。
 
 ## 速さ
 
