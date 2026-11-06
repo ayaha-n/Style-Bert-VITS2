@@ -1,4 +1,5 @@
 import socket
+import threading
 from typing import Any, cast
 
 from style_bert_vits2.logging import logger
@@ -18,6 +19,9 @@ class WorkerClient:
         sock.settimeout(60)
         sock.connect((socket.gethostname(), port))
         self.sock = sock
+        # The socket is shared by every server thread; a request and its
+        # response must not interleave with another thread's.
+        self.lock = threading.Lock()
 
     def __enter__(self) -> "WorkerClient":
         return self
@@ -36,25 +40,28 @@ class WorkerClient:
             "kwargs": kwargs,
         }
         logger.trace(f"client sends request: {data}")
-        send_data(self.sock, data)
-        logger.trace("client sent request successfully")
-        response = receive_data(self.sock)
+        with self.lock:
+            send_data(self.sock, data)
+            logger.trace("client sent request successfully")
+            response = receive_data(self.sock)
         logger.trace(f"client received response: {response}")
         return response.get("return")
 
     def status(self) -> int:
         data = {"request-type": RequestType.STATUS}
         logger.trace(f"client sends request: {data}")
-        send_data(self.sock, data)
-        logger.trace("client sent request successfully")
-        response = receive_data(self.sock)
+        with self.lock:
+            send_data(self.sock, data)
+            logger.trace("client sent request successfully")
+            response = receive_data(self.sock)
         logger.trace(f"client received response: {response}")
         return cast(int, response.get("client-count"))
 
     def quit_server(self) -> None:
         data = {"request-type": RequestType.QUIT_SERVER}
         logger.trace(f"client sends request: {data}")
-        send_data(self.sock, data)
-        logger.trace("client sent request successfully")
-        response = receive_data(self.sock)
+        with self.lock:
+            send_data(self.sock, data)
+            logger.trace("client sent request successfully")
+            response = receive_data(self.sock)
         logger.trace(f"client received response: {response}")
