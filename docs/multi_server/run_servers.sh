@@ -6,6 +6,7 @@
 #   起動後に各プロセスへ MODEL (既定 new_model3) で 1 回合成してモデルを読み込ませておく
 #   1 つ落ちても nginx が残りに振り分ける。落ちたものを戻す: tmux respawn-window -k -t sbv2:tts8002
 #   様子を見る: tmux attach -t sbv2   止める: tmux kill-session -t sbv2
+# 詳しくは docs/multi_server.md
 set -euo pipefail
 N=${1:-2}
 PORT=${2:-8000}
