@@ -1,0 +1,34 @@
+# run_servers.sh が @ で囲んだ所を埋めて使う (root なしで動かすため、ファイルはすべて実行用ディレクトリに置く)
+worker_processes 1;
+pid @RUN@/nginx.pid;
+error_log @RUN@/error.log;
+
+events {
+  worker_connections 1024;
+}
+
+http {
+  access_log @RUN@/access.log;
+  client_body_temp_path @RUN@/tmp/client;
+  proxy_temp_path @RUN@/tmp/proxy;
+  fastcgi_temp_path @RUN@/tmp/fastcgi;
+  uwsgi_temp_path @RUN@/tmp/uwsgi;
+  scgi_temp_path @RUN@/tmp/scgi;
+
+  upstream sbv2 {
+    # 処理中のリクエストが少ないプロセスに送る (合成 1 回の重さはほぼ同じ)
+    least_conn;
+@BACKENDS@
+  }
+
+  server {
+    listen @PORT@;
+    client_max_body_size 10m;
+    location / {
+      proxy_pass http://sbv2;
+      proxy_read_timeout 120s;
+      # 落ちたプロセスに送った POST も別のプロセスでやり直す (合成と g2p は何度送っても同じ結果)
+      proxy_next_upstream error http_502 http_503 non_idempotent;
+    }
+  }
+}
